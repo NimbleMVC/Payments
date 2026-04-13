@@ -1,0 +1,34 @@
+{
+    "name": "nimblephp/payments",
+    "description": "Payments for NimblePHP",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "NimblePHP\\Payments\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "NimblePHP\\Payments\\Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Krzysztof Żyłka",
+            "email": "krzysztofzylka@yahoo.com"
+        }
+    ],
+    "minimum-stability": "dev",
+    "require": {
+        "php": ">=8.4",
+        "ext-curl": "*",
+        "nimblephp/framework": "^0.4.3",
+        "nimblephp/migrations": "^0.3.2",
+        "brick/money":  "^0.12.2",
+        "krzysztofzylka/database-manager": "^1.1.17"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.5"
+    }
+}
