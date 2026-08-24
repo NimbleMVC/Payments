@@ -2,7 +2,6 @@
 
 namespace NimblePHP\Payments\DTO;
 
-use Brick\Money\Money;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
 
@@ -24,6 +23,7 @@ use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
  */
 class PaymentTransactionDTO
 {
+    use HasMoneyAmount;
 
     public string|PaymentSystemEnum $provider;
 
@@ -42,10 +42,6 @@ class PaymentTransactionDTO
     public ?string $objectType = null;
 
     public ?int $objectId = null;
-
-    public int|Money $amount;
-
-    public string $currency = 'PLN';
 
     public string|PaymentTransactionStatusEnum $status = PaymentTransactionStatusEnum::pending;
 
@@ -70,15 +66,6 @@ class PaymentTransactionDTO
             : PaymentSystemEnum::fromString($this->provider)->value;
     }
 
-    public function getAmount(): int
-    {
-        if (is_int($this->amount)) {
-            return $this->amount;
-        }
-
-        return $this->amount->getMinorAmount()->toInt();
-    }
-
     public function getStatus(): string
     {
         return $this->status instanceof PaymentTransactionStatusEnum
@@ -99,7 +86,7 @@ class PaymentTransactionDTO
             'object_type' => $this->objectType,
             'object_id' => $this->objectId,
             'amount' => $this->getAmount(),
-            'currency' => $this->currency,
+            'currency' => $this->getCurrency(),
             'status' => $this->getStatus(),
             'request_payload' => $this->encodeJson($this->requestPayload),
             'register_response_payload' => $this->encodeJson($this->registerResponsePayload),

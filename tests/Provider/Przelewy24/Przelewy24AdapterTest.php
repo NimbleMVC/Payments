@@ -166,7 +166,18 @@ class Przelewy24AdapterTest extends TestCase
         $this->assertSame(999, $gateway->receivedTransaction->getAmount());
         $this->assertSame('PLN', $gateway->receivedTransaction->currency);
         $this->assertSame(42, $gateway->receivedTransaction->merchantId);
-        $this->assertSame('the-real-crc', $gateway->receivedTransaction->crc);
+        // PAY-M03: crc is private now, so we cannot read it back directly -
+        // independently recompute the expected signature with the known
+        // config crc and compare, proving it (and not some other value) was
+        // actually used to sign the request.
+        $expectedSign = hash('sha384', json_encode([
+            'sessionId' => 'session-B',
+            'orderId' => 10001,
+            'amount' => 999,
+            'currency' => 'PLN',
+            'crc' => 'the-real-crc',
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        $this->assertSame($expectedSign, $gateway->receivedTransaction->getSign());
         $this->assertSame(PaymentTransactionStatusEnum::completed, $update->status);
         $this->assertSame('session-B', $update->providerSessionId);
         $this->assertSame('10001', $update->providerOrderId);

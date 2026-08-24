@@ -2,6 +2,7 @@
 
 namespace NimblePHP\Payments\Model;
 
+use krzysztofzylka\DatabaseManager\DatabaseManager;
 use NimblePHP\Framework\Abstracts\AbstractModel;
 use NimblePHP\Framework\Exception\DatabaseException;
 use NimblePHP\Framework\Exception\NimbleException;
@@ -9,11 +10,29 @@ use NimblePHP\Framework\Exception\NotFoundException;
 use NimblePHP\Payments\DTO\PaymentTransactionDTO;
 use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
+use NimblePHP\Payments\Exceptions\DuplicateProviderSessionException;
+use NimblePHP\Payments\Exceptions\ProviderIdentifierConflictException;
+use NimblePHP\Payments\Support\PayloadRedactor;
+use PDO;
+use PDOException;
 
 class PaymentTransactionModel extends AbstractModel
 {
 
     public null|string|false $useTable = 'module_payment_transaction';
+
+    /**
+     * PAY-H03: once a record reaches one of these, no further
+     * applyProviderUpdate() call can change it - not even to the same
+     * terminal status again. A late/duplicate/forged webhook cannot
+     * downgrade completed to processing, and two concurrent workers racing
+     * to finalize the same transaction can never both succeed.
+     */
+    private const TERMINAL_STATUSES = [
+        PaymentTransactionStatusEnum::completed->value,
+        PaymentTransactionStatusEnum::failed->value,
+        PaymentTransactionStatusEnum::cancelled->value,
+    ];
 
     /**
      * Create a new record forced into the server-controlled 'pending' state
@@ -37,7 +56,7 @@ class PaymentTransactionModel extends AbstractModel
             'object_type' => $transaction->objectType,
             'object_id' => $transaction->objectId,
             'amount' => $transaction->getAmount(),
-            'currency' => $transaction->currency,
+            'currency' => $transaction->getCurrency(),
             'status' => PaymentTransactionStatusEnum::pending->value,
             'request_payload' => $this->encodeJsonInput($transaction->requestPayload),
             'metadata' => $this->encodeJsonInput($transaction->metadata),
@@ -75,39 +94,111 @@ class PaymentTransactionModel extends AbstractModel
     }
 
     /**
+     * Strict lookup used by webhook handling (PAY-H02). Unlike the old
+     * behaviour (three independent, sequential lookups that stopped at the
+     * first hit and could resolve *different* identifiers to *different*
+     * records), the record is found by exactly one primary key - provider +
+     * session ID, the identifier every registered transaction always has
+     * (matches the unique index from migration 1787522400) - and every
+     * other identifier present in the payload is then reconciled against
+     * what is already stored: a value the record doesn't have yet is
+     * accepted (it hasn't been assigned by the provider yet), but a value
+     * that contradicts one already on file throws instead of silently
+     * updating the "wrong" identifier.
+     *
      * @throws DatabaseException
+     * @throws ProviderIdentifierConflictException
      */
     public function findByProviderIdentifiers(
+        string $provider,
         ?string $sessionId = null,
         ?string $orderId = null,
         ?string $transactionId = null
     ): array {
-        $lookups = [
-            'module_payment_transaction.provider_transaction_id' => $transactionId,
-            'module_payment_transaction.provider_order_id' => $orderId,
-            'module_payment_transaction.provider_session_id' => $sessionId,
-        ];
+        if ($sessionId === null || $sessionId === '') {
+            return [];
+        }
 
-        foreach ($lookups as $column => $value) {
-            if ($value === null || $value === '') {
+        $record = $this->findActiveByProviderSession($provider, $sessionId);
+
+        if ($record === []) {
+            return [];
+        }
+
+        $row = $record['module_payment_transaction'];
+
+        foreach ([
+            'provider_order_id' => $orderId,
+            'provider_transaction_id' => $transactionId,
+        ] as $column => $incoming) {
+            if ($incoming === null || $incoming === '') {
                 continue;
             }
 
-            $transaction = $this->read([$column => $value]);
+            $stored = $row[$column] ?? null;
 
-            if ($transaction !== []) {
-                return $transaction;
+            if ($stored !== null && $stored !== '' && (string)$stored !== $incoming) {
+                throw new ProviderIdentifierConflictException(sprintf(
+                    'Payload %s "%s" conflicts with the value already stored ("%s") for provider session "%s".',
+                    $column,
+                    $incoming,
+                    (string)$stored,
+                    $sessionId
+                ));
             }
         }
 
-        return [];
+        return $record;
     }
 
     /**
+     * Apply a provider response to the record already selected via setId()
+     * (PAY-H03). The update is atomic and conditional: it is applied only
+     * while the record's current status is NOT already terminal
+     * (completed/failed/cancelled) - once terminal, the record is
+     * immutable, full stop. This is what makes a late or duplicate webhook
+     * unable to downgrade completed to processing, and what guarantees that
+     * of any number of concurrent callers racing to finalize the same
+     * transaction, at most one can ever win.
+     *
+     * date_completed and date_failed are mutually exclusive (PAY-M08):
+     * setting one always clears the other in the same atomic statement, so
+     * a record can never carry both, or a stale date left over from a
+     * status the record no longer has.
+     *
+     * @return bool True when this call's data was actually written (the
+     *         record was not already terminal). False means the update was
+     *         rejected outright - e.g. a webhook arriving after the record
+     *         already completed/failed/cancelled. Combine with
+     *         $update->status->isTerminal() to get the "did this call newly
+     *         finalize the transaction" signal a caller should gate
+     *         one-time business side effects on
+     *         (PaymentTransactionFlowService does this for
+     *         PaymentFlowResultDTO::isNewlyFinalized()).
      * @throws DatabaseException
      * @throws NimbleException
+     * @throws DuplicateProviderSessionException PAY-M01: this call's
+     *         provider_session_id already belongs to a different row.
      */
     public function applyProviderUpdate(ProviderTransactionUpdateDTO $update, string $phase): bool
+    {
+        $id = $this->getId();
+
+        if ($id === null) {
+            throw new NimbleException('applyProviderUpdate() requires setId() to be called first.');
+        }
+
+        return $this->executeConditionalUpdate($id, $this->buildProviderUpdateData($update, $phase));
+    }
+
+    /**
+     * Column => value map for a provider response, shared by
+     * applyProviderUpdate() and test doubles that need the exact same
+     * field mapping without going through the atomic SQL path.
+     *
+     * @throws NimbleException
+     */
+    protected function buildProviderUpdateData(ProviderTransactionUpdateDTO $update, string $phase): array
     {
         $data = [
             'status' => $update->status->value,
@@ -144,28 +235,112 @@ class PaymentTransactionModel extends AbstractModel
             $data[$payloadColumn] = $encodedPayload;
         }
 
-        if ($phase === 'verify' && $update->status === PaymentTransactionStatusEnum::completed) {
+        // PAY-M08: date_completed/date_failed are always set together with
+        // their opposite explicitly cleared, never independently.
+        if ($update->status === PaymentTransactionStatusEnum::completed) {
             $data['date_completed'] = date('Y-m-d H:i:s');
-        }
-
-        if ($phase === 'verify' && $update->status === PaymentTransactionStatusEnum::failed) {
+            $data['date_failed'] = null;
+        } elseif ($update->status === PaymentTransactionStatusEnum::failed) {
             $data['date_failed'] = date('Y-m-d H:i:s');
+            $data['date_completed'] = null;
         }
 
-        return $this->update($data);
+        return $data;
     }
 
+    /**
+     * PAY-H03: single atomic UPDATE ... WHERE id = :id AND status NOT IN
+     * (terminal). rowCount() === 1 is the proof this call's data was
+     * actually applied (the record was not already terminal at the moment
+     * the database evaluated the condition) - a portable, driver-agnostic
+     * compare-and-set, same idiom as consume()/increment() elsewhere in
+     * this codebase family (Authorization AUT-H06/AUT-M04/AUT-M05).
+     */
+    private function executeConditionalUpdate(int $id, array $data): bool
+    {
+        $pdo = DatabaseManager::$connection->getConnection();
+        $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+        $quote = $driver === 'pgsql' ? '"' : '`';
+        $table = $quote . 'module_payment_transaction' . $quote;
+
+        $setClauses = [];
+        $bindings = [];
+
+        foreach ($data as $column => $value) {
+            $placeholder = 'set_' . $column;
+            $setClauses[] = "{$quote}{$column}{$quote} = :{$placeholder}";
+            $bindings[$placeholder] = $value;
+        }
+
+        $terminalPlaceholders = [];
+        foreach (self::TERMINAL_STATUSES as $index => $status) {
+            $placeholder = 'terminal_' . $index;
+            $terminalPlaceholders[] = ':' . $placeholder;
+            $bindings[$placeholder] = $status;
+        }
+
+        $sql = 'UPDATE ' . $table . ' SET ' . implode(', ', $setClauses)
+            . " WHERE {$quote}id{$quote} = :id AND {$quote}status{$quote} NOT IN (" . implode(', ', $terminalPlaceholders) . ')';
+        $bindings['id'] = $id;
+
+        $statement = $pdo->prepare($sql);
+
+        foreach ($bindings as $name => $value) {
+            $statement->bindValue(
+                $name,
+                $value,
+                is_int($value) ? PDO::PARAM_INT : ($value === null ? PDO::PARAM_NULL : PDO::PARAM_STR)
+            );
+        }
+
+        try {
+            $statement->execute();
+        } catch (PDOException $exception) {
+            // PAY-M01: a duplicate provider_session_id (H02's unique index)
+            // means this call is racing/retrying a registration that
+            // already landed on a different row - surface that distinctly
+            // instead of letting a raw driver exception escape.
+            if ($this->isDuplicateKeyError($exception)) {
+                throw new DuplicateProviderSessionException(
+                    'A payment transaction with this provider session already exists.',
+                    0,
+                    $exception
+                );
+            }
+
+            throw $exception;
+        }
+
+        return $statement->rowCount() === 1;
+    }
+
+    private function isDuplicateKeyError(PDOException $exception): bool
+    {
+        $message = strtolower($exception->getMessage());
+
+        return str_contains($message, 'unique') || str_contains($message, 'duplicate');
+    }
+
+    /** PAY-M04: redacts PII-shaped keys and caps size before storage. */
     private function encodeJson(array $value): ?string
     {
-        $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
-        return $json === false ? null : $json;
+        return PayloadRedactor::encodeForStorage($value);
     }
 
+    /**
+     * PAY-M04: an array input is redacted like any other stored payload. A
+     * pre-serialized string is opaque to key-based redaction - it is only
+     * size-capped; a caller that pre-serializes its own payload is
+     * responsible for not putting PII in it.
+     */
     private function encodeJsonInput(null|string|array $value): ?string
     {
-        if ($value === null || is_string($value)) {
-            return $value;
+        if ($value === null) {
+            return null;
+        }
+
+        if (is_string($value)) {
+            return PayloadRedactor::capSize($value);
         }
 
         return $this->encodeJson($value);

@@ -51,6 +51,13 @@ return new class extends AbstractMigration {
         $this->createIndex('module_payment_transaction', 'module_payment_transaction_provider_status_idx', ['provider_status']);
     }
 
+    /**
+     * PAY-M07: only a pre-existing index (safe to skip - the migration is
+     * being re-run or the index was created some other way) is swallowed
+     * here. Any other failure (bad column, permissions, connection loss,
+     * etc.) must fail the migration loudly instead of leaving the table
+     * silently unindexed.
+     */
     private function createIndex(string $table, string $name, array $columns): void
     {
         try {
@@ -62,8 +69,20 @@ return new class extends AbstractMigration {
             }
 
             $index->execute();
-        } catch (DatabaseManagerException) {
+        } catch (DatabaseManagerException $exception) {
+            if (!$this->isAlreadyExistsError($exception)) {
+                throw $exception;
+            }
         }
+    }
+
+    private function isAlreadyExistsError(DatabaseManagerException $exception): bool
+    {
+        // getMessage() is deliberately genericized by DatabaseManagerException;
+        // the real driver error text lives in getHiddenMessage().
+        $message = strtolower($exception->getHiddenMessage());
+
+        return str_contains($message, 'already exists') || str_contains($message, 'duplicate key name');
     }
 
 };

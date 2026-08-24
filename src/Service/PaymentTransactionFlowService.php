@@ -36,9 +36,14 @@ class PaymentTransactionFlowService
      * transaction start out completed.
      *
      * @throws DatabaseException
+     * @throws \InvalidArgumentException PAY-H04: non-positive amount or unrecognised currency
      */
     public function registerTransaction(PaymentTransactionDTO $transaction, object $providerTransaction): PaymentFlowResultDTO
     {
+        // PAY-H04: validate before anything else - fail fast, consistent
+        // with contacting the provider before any local write (PAY-C02).
+        $transaction->assertValidAmount();
+
         $providerUpdate = $this->adapter->registerTransaction($providerTransaction);
 
         $this->paymentTransactionModel->createPending($transaction);
@@ -48,9 +53,9 @@ class PaymentTransactionFlowService
             throw new RuntimeException('Payment transaction was not created.');
         }
 
-        $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'register');
+        $applied = $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'register');
 
-        return $this->createResult($transactionId, $transaction->getProvider(), 'register', $providerUpdate);
+        return $this->createResult($transactionId, $transaction->getProvider(), 'register', $providerUpdate, $applied);
     }
 
     /**
@@ -104,13 +109,14 @@ class PaymentTransactionFlowService
         );
 
         $providerUpdate = $this->adapter->verifyTransaction($canonicalRequest);
-        $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'verify');
+        $applied = $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'verify');
 
         return $this->createResult(
             $transactionId,
             (string)$record['provider'],
             'verify',
-            $providerUpdate
+            $providerUpdate,
+            $applied
         );
     }
 
@@ -121,11 +127,13 @@ class PaymentTransactionFlowService
      *
      * @throws DatabaseException
      * @throws \NimblePHP\Payments\Exceptions\WebhookAuthenticationException
+     * @throws \NimblePHP\Payments\Exceptions\ProviderIdentifierConflictException PAY-H02
      */
     public function handleWebhook(array $payload): PaymentFlowResultDTO
     {
         $providerUpdate = $this->adapter->parseWebhook($payload);
         $transactionData = $this->paymentTransactionModel->findByProviderIdentifiers(
+            provider: $this->adapter->system()->value,
             sessionId: $providerUpdate->providerSessionId,
             orderId: $providerUpdate->providerOrderId,
             transactionId: $providerUpdate->providerTransactionId
@@ -137,13 +145,14 @@ class PaymentTransactionFlowService
 
         $transactionId = (int)$transactionData['module_payment_transaction']['id'];
         $this->paymentTransactionModel->setId($transactionId);
-        $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'webhook');
+        $applied = $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'webhook');
 
         return $this->createResult(
             $transactionId,
             (string)$transactionData['module_payment_transaction']['provider'],
             'webhook',
-            $providerUpdate
+            $providerUpdate,
+            $applied
         );
     }
 
@@ -151,7 +160,8 @@ class PaymentTransactionFlowService
         int $transactionId,
         string $provider,
         string $phase,
-        ProviderTransactionUpdateDTO $update
+        ProviderTransactionUpdateDTO $update,
+        bool $applied
     ): PaymentFlowResultDTO {
         $checkoutUrl = null;
 
@@ -171,6 +181,7 @@ class PaymentTransactionFlowService
             providerTransactionId: $update->providerTransactionId,
             providerToken: $update->providerToken,
             checkoutUrl: $checkoutUrl,
+            applied: $applied,
         );
     }
 

@@ -216,6 +216,38 @@ class PaymentTransactionFlowServiceTest extends TestCase
     }
 
     /**
+     * PAY-H03 regression test: a webhook for an already-completed
+     * transaction must not downgrade it, and the result must say so
+     * (applied=false, isNewlyFinalized()=false) rather than silently
+     * reporting the webhook's own claimed (stale) status as fact.
+     *
+     * @throws DatabaseException
+     */
+    public function testHandleWebhookForAnAlreadyCompletedTransactionDoesNotApply(): void
+    {
+        $adapter = new FakePaymentProviderAdapter(
+            webhookUpdate: new ProviderTransactionUpdateDTO(
+                status: PaymentTransactionStatusEnum::processing,
+                payload: ['data' => ['sessionId' => 'session-123']],
+                providerStatus: 'notification_received',
+                providerSessionId: 'session-123'
+            )
+        );
+        $model = new FakePaymentTransactionModel();
+        $model->transactionRow = [
+            'module_payment_transaction' => ['id' => 5, 'provider' => 'przelewy24'],
+        ];
+        $model->currentStatus = 'completed';
+
+        $result = (new PaymentTransactionFlowService($adapter, $model))
+            ->handleWebhook(['data' => ['sessionId' => 'session-123']]);
+
+        $this->assertFalse($result->applied);
+        $this->assertFalse($result->isNewlyFinalized());
+        $this->assertSame([], $model->updatedData, 'The already-completed record must not be touched.');
+    }
+
+    /**
      * PAY-C01 regression test: verify is keyed by provider session ID alone.
      * A caller cannot make a legitimately-verified payment for one
      * transaction (found by its own session ID) complete a *different*
@@ -369,6 +401,9 @@ class FakePaymentTransactionModel extends PaymentTransactionModel
     /** @var array[] Every $data array passed to create(), in call order. */
     public array $createCalls = [];
 
+    /** PAY-H03: simulates the terminal-status guard without a real DB. */
+    public ?string $currentStatus = null;
+
     public function create(array $data): bool
     {
         $this->createCalls[] = $data;
@@ -401,7 +436,7 @@ class FakePaymentTransactionModel extends PaymentTransactionModel
         return $this->sessionRows[$providerSessionId] ?? [];
     }
 
-    public function findByProviderIdentifiers(?string $sessionId = null, ?string $orderId = null, ?string $transactionId = null): array
+    public function findByProviderIdentifiers(string $provider, ?string $sessionId = null, ?string $orderId = null, ?string $transactionId = null): array
     {
         $this->lookupSessionId = $sessionId;
 
@@ -410,6 +445,26 @@ class FakePaymentTransactionModel extends PaymentTransactionModel
 
     public function update(array $data): bool
     {
+        $this->updatedData = $data;
+
+        return true;
+    }
+
+    /**
+     * PAY-H03: mirrors the real atomic guard (terminal statuses are
+     * immutable) using an in-memory $currentStatus, but reuses the real
+     * buildProviderUpdateData() field mapping so assertions on
+     * $updatedData still match production behaviour exactly.
+     */
+    public function applyProviderUpdate(\NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO $update, string $phase): bool
+    {
+        $data = $this->buildProviderUpdateData($update, $phase);
+
+        if ($this->currentStatus !== null && in_array($this->currentStatus, ['completed', 'failed', 'cancelled'], true)) {
+            return false;
+        }
+
+        $this->currentStatus = $data['status'];
         $this->updatedData = $data;
 
         return true;
