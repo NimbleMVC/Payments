@@ -22,18 +22,32 @@ class PaymentTransactionFlowService
     }
 
     /**
+     * Register a payment (PAY-C02). The provider call happens *before* any
+     * local record is written: a bad $providerTransaction type or a
+     * provider/network/config error throws with nothing persisted at all,
+     * instead of leaving behind a row that already carries whatever
+     * status/dates/tokens the caller's $transaction happened to set.
+     *
+     * The record is then created forced into 'pending'
+     * (PaymentTransactionModel::createPending() ignores $transaction's own
+     * status/dates/provider identifiers entirely) and immediately filled in
+     * from $providerUpdate - the real, server-obtained provider response -
+     * never from $transaction. A caller cannot make a newly registered
+     * transaction start out completed.
+     *
      * @throws DatabaseException
      */
     public function registerTransaction(PaymentTransactionDTO $transaction, object $providerTransaction): PaymentFlowResultDTO
     {
-        $this->paymentTransactionModel->createFromDto($transaction);
+        $providerUpdate = $this->adapter->registerTransaction($providerTransaction);
+
+        $this->paymentTransactionModel->createPending($transaction);
         $transactionId = $this->paymentTransactionModel->getId();
 
         if ($transactionId === null) {
             throw new RuntimeException('Payment transaction was not created.');
         }
 
-        $providerUpdate = $this->adapter->registerTransaction($providerTransaction);
         $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'register');
 
         return $this->createResult($transactionId, $transaction->getProvider(), 'register', $providerUpdate);
