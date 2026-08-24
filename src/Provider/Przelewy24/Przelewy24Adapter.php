@@ -173,6 +173,9 @@ class Przelewy24Adapter implements PaymentProviderAdapterInterface
             throw new InvalidArgumentException('Przelewy24 adapter requires Przelewy24RegisterTransactionDTO.');
         }
 
+        // PAY-H04
+        $transaction->assertValidAmount();
+
         return $transaction;
     }
 

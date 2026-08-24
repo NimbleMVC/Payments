@@ -108,6 +108,7 @@ Obsługiwane klucze:
 use NimblePHP\Payments\DTO\PaymentTransactionDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Payments;
+use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24ConfigDTO;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24RegisterTransactionDTO;
 
 $payments = new Payments('przelewy24');
@@ -126,7 +127,10 @@ $transaction->objectId = 123;
 // is filled in exclusively from the real provider response below, never
 // from this DTO. Setting them here has no effect.
 
-$register = new Przelewy24RegisterTransactionDTO();
+// PAY-M09: merchantId/posId/crc are populated only from Przelewy24ConfigDTO
+// (constructor argument), never left to be filled in by hand - a
+// config-less DTO cannot produce a valid sign (PAY-M03: crc is private).
+$register = new Przelewy24RegisterTransactionDTO(Przelewy24ConfigDTO::fromConfig());
 $register->sessionId = 'session-123';
 $register->amount = 12345;
 $register->description = 'Order #123';

@@ -20,11 +20,13 @@
         }
     ],
     "minimum-stability": "dev",
+    "prefer-stable": true,
     "require": {
         "php": ">=8.4",
         "ext-curl": "*",
         "nimblephp/framework": "^0.4.3",
         "nimblephp/migrations": "^0.3.2",
+        "nimblephp/crypto": "^0.0.1",
         "brick/money":  "^0.12.2",
         "krzysztofzylka/database-manager": "^1.1.17"
     },
