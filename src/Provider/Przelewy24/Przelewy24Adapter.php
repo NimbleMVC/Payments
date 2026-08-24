@@ -8,6 +8,7 @@ use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
 use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
+use NimblePHP\Payments\Exceptions\WebhookAuthenticationException;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24RegisterTransactionDTO;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24VerifyTransactionDTO;
 
@@ -67,9 +68,17 @@ class Przelewy24Adapter implements PaymentProviderAdapterInterface
         );
     }
 
+    /**
+     * @throws WebhookAuthenticationException PAY-H01: missing/invalid signature
+     *         or a merchant/pos that does not match this adapter's configuration.
+     *         Callers must not mutate any local record when this is thrown.
+     */
     public function parseWebhook(array $payload): ProviderTransactionUpdateDTO
     {
         $data = is_array($payload['data'] ?? null) ? $payload['data'] : $payload;
+
+        $this->verifyWebhookSignature($data);
+
         $providerStatus = $this->extractProviderStatus($data) ?? 'notification_received';
 
         return new ProviderTransactionUpdateDTO(
@@ -108,6 +117,54 @@ class Przelewy24Adapter implements PaymentProviderAdapterInterface
     public function getCheckoutUrl(string $token): string
     {
         return $this->gateway->getCheckoutUrl($token);
+    }
+
+    /**
+     * PAY-H01: authenticate a webhook notification before anything derived
+     * from it is allowed to mutate a local record. Recomputes the SHA-384
+     * signature P24 sends from the notification's own merchantId, posId,
+     * sessionId, amount, originAmount, currency, orderId, methodId and
+     * statement plus this adapter's configured CRC, and requires it to
+     * match byte-for-byte (constant-time) - and requires merchantId/posId
+     * to equal configuration independently of whether the signature check
+     * alone would have caught a mismatch.
+     *
+     * @throws WebhookAuthenticationException
+     */
+    private function verifyWebhookSignature(array $data): void
+    {
+        $sign = $this->extractString($data, ['sign']);
+
+        if ($sign === null) {
+            throw new WebhookAuthenticationException('Przelewy24 webhook notification is missing a signature.');
+        }
+
+        $config = $this->gateway->getConfig();
+        $merchantId = isset($data['merchantId']) ? (int)$data['merchantId'] : null;
+        $posId = isset($data['posId']) ? (int)$data['posId'] : null;
+
+        if ($merchantId !== $config->merchantId || $posId !== $config->posId) {
+            throw new WebhookAuthenticationException(
+                'Przelewy24 webhook notification merchant/pos does not match configuration.'
+            );
+        }
+
+        $expectedSign = hash('sha384', json_encode([
+            'merchantId' => $merchantId,
+            'posId' => $posId,
+            'sessionId' => (string)($data['sessionId'] ?? ''),
+            'amount' => (int)($data['amount'] ?? 0),
+            'originAmount' => (int)($data['originAmount'] ?? 0),
+            'currency' => (string)($data['currency'] ?? ''),
+            'orderId' => (int)($data['orderId'] ?? 0),
+            'methodId' => (int)($data['methodId'] ?? 0),
+            'statement' => (string)($data['statement'] ?? ''),
+            'crc' => $config->crc,
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+
+        if (!hash_equals($expectedSign, (string)$sign)) {
+            throw new WebhookAuthenticationException('Przelewy24 webhook notification signature is invalid.');
+        }
     }
 
     private function assertRegisterTransaction(object $transaction): Przelewy24RegisterTransactionDTO

@@ -115,7 +115,12 @@ class PaymentTransactionFlowService
     }
 
     /**
+     * PAY-H01: $this->adapter->parseWebhook() authenticates the notification
+     * (e.g. verifies its provider signature) before returning anything - no
+     * lookup or mutation below runs for an unauthenticated payload.
+     *
      * @throws DatabaseException
+     * @throws \NimblePHP\Payments\Exceptions\WebhookAuthenticationException
      */
     public function handleWebhook(array $payload): PaymentFlowResultDTO
     {
