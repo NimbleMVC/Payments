@@ -16,11 +16,32 @@ class PaymentTransactionModel extends AbstractModel
     public null|string|false $useTable = 'module_payment_transaction';
 
     /**
+     * Create a new record forced into the server-controlled 'pending' state
+     * (PAY-C02). $transaction is treated as a command: only the fields the
+     * caller may legitimately set at creation are persisted (provider,
+     * account/object binding, amount, currency, request payload, metadata).
+     * status, date_completed, date_failed and every provider_* identifier
+     * or token on $transaction are ignored here - a caller cannot make a
+     * new record start out completed, or carrying provider identifiers
+     * that were never actually issued by the provider. Call
+     * applyProviderUpdate() with the real provider response afterwards to
+     * fill those in.
+     *
      * @throws DatabaseException
      */
-    public function createFromDto(PaymentTransactionDTO $transaction): bool
+    public function createPending(PaymentTransactionDTO $transaction): bool
     {
-        return $this->create($transaction->toDatabaseArray());
+        return $this->create([
+            'provider' => $transaction->getProvider(),
+            'account_id' => $transaction->accountId,
+            'object_type' => $transaction->objectType,
+            'object_id' => $transaction->objectId,
+            'amount' => $transaction->getAmount(),
+            'currency' => $transaction->currency,
+            'status' => PaymentTransactionStatusEnum::pending->value,
+            'request_payload' => $this->encodeJsonInput($transaction->requestPayload),
+            'metadata' => $this->encodeJsonInput($transaction->metadata),
+        ]);
     }
 
     /**
@@ -139,6 +160,15 @@ class PaymentTransactionModel extends AbstractModel
         $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         return $json === false ? null : $json;
+    }
+
+    private function encodeJsonInput(null|string|array $value): ?string
+    {
+        if ($value === null || is_string($value)) {
+            return $value;
+        }
+
+        return $this->encodeJson($value);
     }
 
 }

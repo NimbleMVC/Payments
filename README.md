@@ -120,6 +120,10 @@ $transaction->amount = 12345;
 // authenticated account) - never copied directly from request input.
 $transaction->objectType = 'order';
 $transaction->objectId = 123;
+// PAY-C02: $transaction->status/dateCompleted/dateFailed/provider* are
+// ignored by registerTransaction() - a new record always starts pending and
+// is filled in exclusively from the real provider response below, never
+// from this DTO. Setting them here has no effect.
 
 $register = new Przelewy24RegisterTransactionDTO();
 $register->sessionId = 'session-123';
@@ -191,6 +195,7 @@ Aktualny wspólny storage modułu zawiera między innymi:
 
 ## Callbacki i statusy
 
+- `registerTransaction(...)` kontaktuje operatora **przed** zapisaniem czegokolwiek lokalnie (PAY-C02) — błąd typu, konfiguracji czy sieci nie zostawia po sobie rekordu; nowy rekord zawsze startuje jako `pending`, wypełniany wyłącznie prawdziwą odpowiedzią operatora,
 - callback / webhook operatora nie kończy flow sam z siebie — aktualizuje transakcję do stanu pośredniego i zapisuje surowy payload,
 - finalne potwierdzenie płatności powinno następować po `verifyTransaction(...)`,
 - moduł przechowuje jednocześnie wspólny `status` oraz surowy `provider_status`,

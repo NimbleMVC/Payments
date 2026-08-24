@@ -2,6 +2,7 @@
 
 namespace NimblePHP\Payments\Tests\Service;
 
+use InvalidArgumentException;
 use NimblePHP\Framework\Exception\DatabaseException;
 use NimblePHP\Framework\Exception\NotFoundException;
 use NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface;
@@ -11,6 +12,9 @@ use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
 use NimblePHP\Payments\Model\PaymentTransactionModel;
+use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24ConfigDTO;
+use NimblePHP\Payments\Provider\Przelewy24\Przelewy24Adapter;
+use NimblePHP\Payments\Provider\Przelewy24\Przelewy24Gateway;
 use NimblePHP\Payments\Service\PaymentTransactionFlowService;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
@@ -45,6 +49,86 @@ class PaymentTransactionFlowServiceTest extends TestCase
         $this->assertSame('token-123', $result->providerToken);
         $this->assertSame('https://payments.test/checkout/token-123', $result->checkoutUrl);
         $this->assertSame('token-123', $model->updatedData['provider_token']);
+    }
+
+    /**
+     * PAY-C02 regression test: the exact scenario from the audit - a caller
+     * sets status to completed, then passes a $providerTransaction of the
+     * wrong type. With the real adapter's type guard, nothing may be
+     * persisted at all.
+     *
+     * @throws DatabaseException
+     */
+    public function testRegisterTransactionPersistsNothingWhenTheProviderTransactionTypeIsWrong(): void
+    {
+        $adapter = new Przelewy24Adapter(new Przelewy24Gateway(new Przelewy24ConfigDTO(
+            merchantId: 1,
+            posId: 1,
+            apiKey: 'key',
+            crc: 'crc',
+            sandbox: true
+        )));
+        $model = new FakePaymentTransactionModel();
+        $transaction = new PaymentTransactionDTO();
+        $transaction->provider = PaymentSystemEnum::przelewy24;
+        $transaction->amount = 12345;
+        $transaction->status = PaymentTransactionStatusEnum::completed;
+
+        try {
+            (new PaymentTransactionFlowService($adapter, $model))
+                ->registerTransaction($transaction, new stdClass());
+            $this->fail('Wrong providerTransaction type should have been rejected.');
+        } catch (InvalidArgumentException) {
+            $this->addToAssertionCount(1);
+        }
+
+        $this->assertSame([], $model->createCalls, 'No record may be created when registration is rejected.');
+        $this->assertNull($model->getId());
+    }
+
+    /**
+     * PAY-C02: even when registration succeeds, a caller-supplied status of
+     * completed (or any provider identifiers/dates) must never reach the
+     * database - the new record is always forced to pending and filled in
+     * exclusively from the real provider response.
+     *
+     * @throws DatabaseException
+     */
+    public function testRegisterTransactionForcesPendingRegardlessOfCallerSuppliedStatus(): void
+    {
+        $adapter = new FakePaymentProviderAdapter(
+            registerUpdate: new ProviderTransactionUpdateDTO(
+                status: PaymentTransactionStatusEnum::pending,
+                payload: ['data' => ['token' => 'token-123']],
+                providerSessionId: 'session-123',
+                providerToken: 'token-123'
+            )
+        );
+        $model = new FakePaymentTransactionModel();
+        $transaction = new PaymentTransactionDTO();
+        $transaction->provider = PaymentSystemEnum::przelewy24;
+        $transaction->amount = 12345;
+        // An attacker (or a bug) trying to smuggle a finished, attacker-chosen
+        // state through the "command" DTO.
+        $transaction->status = PaymentTransactionStatusEnum::completed;
+        $transaction->dateCompleted = '2020-01-01 00:00:00';
+        $transaction->providerToken = 'attacker-chosen-token';
+        $transaction->providerSessionId = 'attacker-chosen-session';
+
+        (new PaymentTransactionFlowService($adapter, $model))
+            ->registerTransaction($transaction, new stdClass());
+
+        $this->assertCount(1, $model->createCalls);
+        $created = $model->createCalls[0];
+        $this->assertSame('pending', $created['status']);
+        $this->assertArrayNotHasKey('date_completed', $created);
+        $this->assertArrayNotHasKey('provider_token', $created);
+        $this->assertArrayNotHasKey('provider_session_id', $created);
+
+        // The real provider token/session (from $providerUpdate), not the
+        // attacker-chosen ones, are what end up applied afterwards.
+        $this->assertSame('token-123', $model->updatedData['provider_token']);
+        $this->assertSame('session-123', $model->updatedData['provider_session_id']);
     }
 
     /**
@@ -245,8 +329,12 @@ class FakePaymentTransactionModel extends PaymentTransactionModel
 
     public ?string $lookupSessionId = null;
 
+    /** @var array[] Every $data array passed to create(), in call order. */
+    public array $createCalls = [];
+
     public function create(array $data): bool
     {
+        $this->createCalls[] = $data;
         $this->setId(1);
 
         return true;

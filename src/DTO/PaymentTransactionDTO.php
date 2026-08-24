@@ -12,6 +12,15 @@ use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
  * caller is actually entitled to pay for) - never copied directly from
  * request input. This module has no way to enforce that; getting it wrong
  * lets a caller register a transaction against someone else's order/account.
+ *
+ * PAY-C02: when this DTO is passed to
+ * PaymentTransactionFlowService::registerTransaction(), $status,
+ * $dateCompleted, $dateFailed and every $provider* field below are ignored -
+ * PaymentTransactionModel::createPending() always forces a new record to
+ * 'pending' and applyProviderUpdate() then fills those columns exclusively
+ * from the real provider response, never from this DTO. Setting them here
+ * has no effect on registration; they only matter for the low-level
+ * PaymentTransactionModel API.
  */
 class PaymentTransactionDTO
 {
