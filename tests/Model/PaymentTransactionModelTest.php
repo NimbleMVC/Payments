@@ -6,7 +6,10 @@ use krzysztofzylka\DatabaseManager\Cache;
 use krzysztofzylka\DatabaseManager\DatabaseConnect;
 use krzysztofzylka\DatabaseManager\DatabaseManager;
 use krzysztofzylka\DatabaseManager\Enum\DatabaseType;
+use NimblePHP\Crypto\Services\EncryptionService;
+use NimblePHP\Crypto\Services\KeyRepository;
 use NimblePHP\Framework\Config;
+use NimblePHP\Framework\Container\ServiceContainer;
 use NimblePHP\Framework\Kernel;
 use NimblePHP\Framework\Middleware\MiddlewareManager;
 use NimblePHP\Payments\DTO\PaymentTransactionDTO;
@@ -86,6 +89,15 @@ class PaymentTransactionModelTest extends TestCase
 
         $this->model = new PaymentTransactionModel();
         $this->model->prepareTableInstance();
+
+        // No crypto.encryption registered by default - PAY-M04 encryption
+        // is opt-in via NimblePHP\Crypto, exercised explicitly below.
+        Kernel::$serviceContainer = new ServiceContainer();
+    }
+
+    protected function tearDown(): void
+    {
+        Kernel::$serviceContainer = new ServiceContainer();
     }
 
     private function insertRow(array $overrides = []): int
@@ -285,5 +297,63 @@ class PaymentTransactionModelTest extends TestCase
         $row = $this->pdo->query("SELECT webhook_payload FROM module_payment_transaction WHERE id = {$id}")->fetch(PDO::FETCH_ASSOC);
         $this->assertStringNotContainsString('john@example.com', $row['webhook_payload']);
         $this->assertStringContainsString('10001', $row['webhook_payload']);
+    }
+
+    /**
+     * PAY-M04 regression test: when the host application has NimblePHP\Crypto
+     * available, payload/token columns are actually encrypted at rest (not
+     * just redacted) - the raw DB row is unreadable ciphertext, but the
+     * model's own read methods still return the original plaintext.
+     */
+    public function testPayloadsAreEncryptedAtRestWhenCryptoIsAvailable(): void
+    {
+        Config::set('ENCRYPTION_KEY_CURRENT', 1);
+        Config::set('ENCRYPTION_KEY_1', 'test-key-material-not-for-production-use');
+        Kernel::$serviceContainer->set('crypto.encryption', new EncryptionService(new KeyRepository()));
+
+        $transaction = new PaymentTransactionDTO();
+        $transaction->provider = PaymentSystemEnum::przelewy24;
+        $transaction->amount = 12345;
+        $transaction->objectType = 'order';
+        $transaction->objectId = 42;
+        $transaction->metadata = ['orderNumber' => 'FV/2026/05/123'];
+
+        $this->model->createPending($transaction);
+        $id = $this->model->getId();
+        $this->model->setId($id);
+
+        $this->model->applyProviderUpdate(new ProviderTransactionUpdateDTO(
+            status: PaymentTransactionStatusEnum::processing,
+            payload: ['data' => ['status' => 'success']],
+            providerToken: 'secret-checkout-token',
+        ), 'register');
+
+        $rawRow = $this->pdo->query("SELECT metadata, register_response_payload, provider_token FROM module_payment_transaction WHERE id = {$id}")->fetch(PDO::FETCH_ASSOC);
+        $this->assertStringNotContainsString('FV/2026/05/123', $rawRow['metadata']);
+        $this->assertStringNotContainsString('success', $rawRow['register_response_payload']);
+        $this->assertStringNotContainsString('secret-checkout-token', $rawRow['provider_token']);
+
+        $decrypted = $this->model->readTransaction($id)['module_payment_transaction'];
+        $this->assertStringContainsString('FV/2026/05/123', $decrypted['metadata']);
+        $this->assertStringContainsString('success', $decrypted['register_response_payload']);
+        $this->assertSame('secret-checkout-token', $decrypted['provider_token']);
+    }
+
+    /**
+     * PAY-M04 regression test: a row written while Crypto was unavailable
+     * (plaintext) must still be readable once Crypto becomes available -
+     * decrypt() falls back to the raw value instead of failing.
+     */
+    public function testLegacyPlaintextPayloadsAreStillReadableOnceCryptoBecomesAvailable(): void
+    {
+        $id = $this->insertRow(['status' => 'pending']);
+        $this->pdo->exec("UPDATE module_payment_transaction SET metadata = '{\"legacy\":\"plaintext\"}' WHERE id = {$id}");
+
+        Config::set('ENCRYPTION_KEY_CURRENT', 1);
+        Config::set('ENCRYPTION_KEY_1', 'test-key-material-not-for-production-use');
+        Kernel::$serviceContainer->set('crypto.encryption', new EncryptionService(new KeyRepository()));
+
+        $row = $this->model->readTransaction($id)['module_payment_transaction'];
+        $this->assertSame('{"legacy":"plaintext"}', $row['metadata']);
     }
 }

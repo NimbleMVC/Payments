@@ -12,6 +12,7 @@ use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
 use NimblePHP\Payments\Exceptions\DuplicateProviderSessionException;
 use NimblePHP\Payments\Exceptions\ProviderIdentifierConflictException;
+use NimblePHP\Payments\Support\PaymentPayloadCipher;
 use NimblePHP\Payments\Support\PayloadRedactor;
 use PDO;
 use PDOException;
@@ -32,6 +33,23 @@ class PaymentTransactionModel extends AbstractModel
         PaymentTransactionStatusEnum::completed->value,
         PaymentTransactionStatusEnum::failed->value,
         PaymentTransactionStatusEnum::cancelled->value,
+    ];
+
+    /**
+     * PAY-M04: columns encrypted at rest via PaymentPayloadCipher, when the
+     * host application has NimblePHP\Crypto available. Never includes
+     * provider_session_id/provider_order_id/provider_transaction_id - those
+     * stay plaintext because they are looked up by equality and enforced
+     * unique at the database level (PAY-H02); encrypting them would break
+     * both (AES-GCM ciphertext isn't deterministic).
+     */
+    private const ENCRYPTED_COLUMNS = [
+        'request_payload',
+        'register_response_payload',
+        'verify_response_payload',
+        'webhook_payload',
+        'metadata',
+        'provider_token',
     ];
 
     /**
@@ -74,7 +92,7 @@ class PaymentTransactionModel extends AbstractModel
             throw new NotFoundException('Payment transaction not found.');
         }
 
-        return $transaction;
+        return $this->decryptRow($transaction);
     }
 
     /**
@@ -87,10 +105,10 @@ class PaymentTransactionModel extends AbstractModel
      */
     public function findActiveByProviderSession(string $provider, string $providerSessionId): array
     {
-        return $this->read([
+        return $this->decryptRow($this->read([
             'module_payment_transaction.provider' => $provider,
             'module_payment_transaction.provider_session_id' => $providerSessionId,
-        ]);
+        ]));
     }
 
     /**
@@ -217,7 +235,7 @@ class PaymentTransactionModel extends AbstractModel
         }
 
         if ($update->providerToken !== null) {
-            $data['provider_token'] = $update->providerToken;
+            $data['provider_token'] = PaymentPayloadCipher::encrypt($update->providerToken);
         }
 
         if ($update->providerStatus !== null) {
@@ -321,17 +339,18 @@ class PaymentTransactionModel extends AbstractModel
         return str_contains($message, 'unique') || str_contains($message, 'duplicate');
     }
 
-    /** PAY-M04: redacts PII-shaped keys and caps size before storage. */
+    /** PAY-M04: redacts PII-shaped keys, caps size, then encrypts (if available) before storage. */
     private function encodeJson(array $value): ?string
     {
-        return PayloadRedactor::encodeForStorage($value);
+        return PaymentPayloadCipher::encrypt(PayloadRedactor::encodeForStorage($value));
     }
 
     /**
      * PAY-M04: an array input is redacted like any other stored payload. A
      * pre-serialized string is opaque to key-based redaction - it is only
      * size-capped; a caller that pre-serializes its own payload is
-     * responsible for not putting PII in it.
+     * responsible for not putting PII in it. Both are encrypted (if
+     * available) same as any other stored payload.
      */
     private function encodeJsonInput(null|string|array $value): ?string
     {
@@ -340,10 +359,33 @@ class PaymentTransactionModel extends AbstractModel
         }
 
         if (is_string($value)) {
-            return PayloadRedactor::capSize($value);
+            return PaymentPayloadCipher::encrypt(PayloadRedactor::capSize($value));
         }
 
         return $this->encodeJson($value);
+    }
+
+    /**
+     * PAY-M04: decrypts every encrypted column in a read() result. A no-op
+     * for values that were never encrypted (Crypto unavailable at write
+     * time, or a legacy plaintext row) - PaymentPayloadCipher::decrypt()
+     * returns the raw value unchanged when it isn't valid ciphertext.
+     */
+    private function decryptRow(array $record): array
+    {
+        if (!isset($record['module_payment_transaction']) || !is_array($record['module_payment_transaction'])) {
+            return $record;
+        }
+
+        foreach (self::ENCRYPTED_COLUMNS as $column) {
+            if (array_key_exists($column, $record['module_payment_transaction'])) {
+                $record['module_payment_transaction'][$column] = PaymentPayloadCipher::decrypt(
+                    $record['module_payment_transaction'][$column]
+                );
+            }
+        }
+
+        return $record;
     }
 
 }
