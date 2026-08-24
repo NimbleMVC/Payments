@@ -6,6 +6,13 @@ use Brick\Money\Money;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
 
+/**
+ * PAY-C01: $accountId, $objectType and $objectId must be set from a
+ * server-authorized domain object (the authenticated account, the order the
+ * caller is actually entitled to pay for) - never copied directly from
+ * request input. This module has no way to enforce that; getting it wrong
+ * lets a caller register a transaction against someone else's order/account.
+ */
 class PaymentTransactionDTO
 {
 

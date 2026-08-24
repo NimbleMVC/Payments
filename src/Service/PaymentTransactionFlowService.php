@@ -3,10 +3,12 @@
 namespace NimblePHP\Payments\Service;
 
 use NimblePHP\Framework\Exception\DatabaseException;
+use NimblePHP\Framework\Exception\NotFoundException;
 use NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface;
 use NimblePHP\Payments\DTO\PaymentFlowResultDTO;
 use NimblePHP\Payments\DTO\PaymentTransactionDTO;
 use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
+use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Model\PaymentTransactionModel;
 use RuntimeException;
 
@@ -38,19 +40,61 @@ class PaymentTransactionFlowService
     }
 
     /**
+     * Verify a payment (PAY-C01). Which local record gets updated is
+     * determined solely by looking it up via $providerSessionId - the
+     * caller cannot point verify at an arbitrary local transaction ID while
+     * supplying a different, independently-valid session/order/amount, so a
+     * legitimately completed payment for one transaction can never be
+     * applied to a different one.
+     *
+     * $providerOrderId comes from the provider (webhook/return redirect) and
+     * is only used as the required API parameter for that provider's verify
+     * call - it never changes which local record is looked up or updated.
+     * If the record already has a provider_order_id on file that
+     * contradicts the one supplied here, the operation is aborted instead
+     * of silently overwriting it.
+     *
      * @throws DatabaseException
      */
-    public function verifyTransaction(int $transactionId, object $providerTransaction): PaymentFlowResultDTO
+    public function verifyTransaction(string $providerSessionId, ?string $providerOrderId = null): PaymentFlowResultDTO
     {
-        $transactionData = $this->paymentTransactionModel->readTransaction($transactionId);
+        $transactionData = $this->paymentTransactionModel->findActiveByProviderSession(
+            $this->adapter->system()->value,
+            $providerSessionId
+        );
+
+        if ($transactionData === []) {
+            throw new NotFoundException('Payment transaction not found for provider session.');
+        }
+
+        $record = $transactionData['module_payment_transaction'];
+        $transactionId = (int)$record['id'];
+        $storedOrderId = $record['provider_order_id'] ?? null;
+
+        if (
+            $providerOrderId !== null
+            && $storedOrderId !== null
+            && $storedOrderId !== ''
+            && (string)$storedOrderId !== $providerOrderId
+        ) {
+            throw new RuntimeException('Provider order ID does not match the stored transaction.');
+        }
+
         $this->paymentTransactionModel->setId($transactionId);
 
-        $providerUpdate = $this->adapter->verifyTransaction($providerTransaction);
+        $canonicalRequest = new VerifyTransactionRequestDTO(
+            providerSessionId: $providerSessionId,
+            providerOrderId: $providerOrderId ?? ($storedOrderId !== null && $storedOrderId !== '' ? (string)$storedOrderId : null),
+            amount: (int)$record['amount'],
+            currency: (string)$record['currency'],
+        );
+
+        $providerUpdate = $this->adapter->verifyTransaction($canonicalRequest);
         $this->paymentTransactionModel->applyProviderUpdate($providerUpdate, 'verify');
 
         return $this->createResult(
             $transactionId,
-            (string)$transactionData['module_payment_transaction']['provider'],
+            (string)$record['provider'],
             'verify',
             $providerUpdate
         );

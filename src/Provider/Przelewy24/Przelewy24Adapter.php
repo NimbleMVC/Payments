@@ -5,6 +5,7 @@ namespace NimblePHP\Payments\Provider\Przelewy24;
 use InvalidArgumentException;
 use NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface;
 use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
+use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24RegisterTransactionDTO;
@@ -38,18 +39,31 @@ class Przelewy24Adapter implements PaymentProviderAdapterInterface
         );
     }
 
-    public function verifyTransaction(object $transaction): ProviderTransactionUpdateDTO
+    public function verifyTransaction(VerifyTransactionRequestDTO $transaction): ProviderTransactionUpdateDTO
     {
-        $transaction = $this->assertVerifyTransaction($transaction);
-        $response = $this->gateway->verifyTransaction($transaction);
+        if ($transaction->providerOrderId === null || $transaction->providerOrderId === '') {
+            throw new InvalidArgumentException('Przelewy24 verify requires a provider order ID.');
+        }
+
+        // PAY-C01: the request sent to P24 is built entirely from the
+        // canonical (server-stored) data plus this adapter's own config -
+        // never from caller-supplied amount/currency/merchant/pos/crc.
+        $config = $this->gateway->getConfig();
+        $p24Transaction = new Przelewy24VerifyTransactionDTO($config);
+        $p24Transaction->sessionId = $transaction->providerSessionId;
+        $p24Transaction->orderId = (int)$transaction->providerOrderId;
+        $p24Transaction->amount = $transaction->amount;
+        $p24Transaction->currency = $transaction->currency;
+
+        $response = $this->gateway->verifyTransaction($p24Transaction);
         $providerStatus = $this->extractProviderStatus($response->data);
 
         return new ProviderTransactionUpdateDTO(
             status: $this->mapStatus($providerStatus, $response->raw),
             payload: $response->raw,
             providerStatus: $providerStatus,
-            providerSessionId: $transaction->sessionId,
-            providerOrderId: (string)$transaction->orderId
+            providerSessionId: $transaction->providerSessionId,
+            providerOrderId: $transaction->providerOrderId
         );
     }
 
@@ -100,15 +114,6 @@ class Przelewy24Adapter implements PaymentProviderAdapterInterface
     {
         if (!$transaction instanceof Przelewy24RegisterTransactionDTO) {
             throw new InvalidArgumentException('Przelewy24 adapter requires Przelewy24RegisterTransactionDTO.');
-        }
-
-        return $transaction;
-    }
-
-    private function assertVerifyTransaction(object $transaction): Przelewy24VerifyTransactionDTO
-    {
-        if (!$transaction instanceof Przelewy24VerifyTransactionDTO) {
-            throw new InvalidArgumentException('Przelewy24 adapter requires Przelewy24VerifyTransactionDTO.');
         }
 
         return $transaction;

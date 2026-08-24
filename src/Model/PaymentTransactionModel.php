@@ -38,6 +38,22 @@ class PaymentTransactionModel extends AbstractModel
     }
 
     /**
+     * Strict lookup used by verify (PAY-C01): keyed only by provider +
+     * provider_session_id, never by a caller-supplied local transaction ID.
+     * This is what makes it structurally impossible for a verify call to
+     * confirm one session while updating an unrelated local record.
+     *
+     * @throws DatabaseException
+     */
+    public function findActiveByProviderSession(string $provider, string $providerSessionId): array
+    {
+        return $this->read([
+            'module_payment_transaction.provider' => $provider,
+            'module_payment_transaction.provider_session_id' => $providerSessionId,
+        ]);
+    }
+
+    /**
      * @throws DatabaseException
      */
     public function findByProviderIdentifiers(

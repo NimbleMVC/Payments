@@ -3,9 +3,11 @@
 namespace NimblePHP\Payments\Tests\Service;
 
 use NimblePHP\Framework\Exception\DatabaseException;
+use NimblePHP\Framework\Exception\NotFoundException;
 use NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface;
 use NimblePHP\Payments\DTO\PaymentTransactionDTO;
 use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
+use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
 use NimblePHP\Payments\Model\PaymentTransactionModel;
@@ -92,10 +94,101 @@ class PaymentTransactionFlowServiceTest extends TestCase
             ->handleWebhook(['data' => ['sessionId' => 'missing-session']]);
     }
 
+    /**
+     * PAY-C01 regression test: verify is keyed by provider session ID alone.
+     * A caller cannot make a legitimately-verified payment for one
+     * transaction (found by its own session ID) complete a *different*
+     * local record - there is no parameter left to name that other record.
+     *
+     * @throws DatabaseException
+     */
+    public function testVerifyingASessionOnlyEverUpdatesTheRecordItBelongsTo(): void
+    {
+        $adapter = new FakePaymentProviderAdapter(
+            verifyUpdate: new ProviderTransactionUpdateDTO(
+                status: PaymentTransactionStatusEnum::completed,
+                payload: ['data' => ['status' => 'success']],
+                providerStatus: 'success',
+                providerSessionId: 'session-B',
+                providerOrderId: 'order-B'
+            )
+        );
+        $model = new FakePaymentTransactionModel();
+        // Record A ("victim") exists conceptually with a higher amount, but
+        // is never returned by any lookup this test performs - proving the
+        // service has no way to reach it from session B's credentials.
+        $model->sessionRows['session-B'] = [
+            'module_payment_transaction' => [
+                'id' => 2,
+                'provider' => 'przelewy24',
+                'amount' => 999,
+                'currency' => 'PLN',
+                'provider_order_id' => null,
+            ],
+        ];
+
+        $result = (new PaymentTransactionFlowService($adapter, $model))
+            ->verifyTransaction('session-B', 'order-B');
+
+        // The record updated is exactly the one owning session-B (id 2),
+        // never the attacker-hoped-for victim record (e.g. id 1).
+        $this->assertSame(2, $result->transactionId);
+        $this->assertSame(2, $model->getId());
+        $this->assertSame(PaymentTransactionStatusEnum::completed->value, $model->updatedData['status']);
+
+        // The request actually sent to the provider used record B's own
+        // stored amount, never an attacker-supplied one.
+        $this->assertNotNull($adapter->receivedVerifyRequest);
+        $this->assertSame(999, $adapter->receivedVerifyRequest->amount);
+        $this->assertSame('session-B', $adapter->receivedVerifyRequest->providerSessionId);
+    }
+
+    /**
+     * @throws DatabaseException
+     */
+    public function testVerifyTransactionThrowsWhenSessionIsUnknown(): void
+    {
+        $this->expectException(NotFoundException::class);
+
+        $adapter = new FakePaymentProviderAdapter();
+        $model = new FakePaymentTransactionModel();
+
+        (new PaymentTransactionFlowService($adapter, $model))->verifyTransaction('unknown-session');
+    }
+
+    /**
+     * @throws DatabaseException
+     */
+    public function testVerifyTransactionRejectsAnOrderIdThatContradictsTheStoredOne(): void
+    {
+        $adapter = new FakePaymentProviderAdapter();
+        $model = new FakePaymentTransactionModel();
+        $model->sessionRows['session-A'] = [
+            'module_payment_transaction' => [
+                'id' => 1,
+                'provider' => 'przelewy24',
+                'amount' => 12345,
+                'currency' => 'PLN',
+                'provider_order_id' => 'order-original',
+            ],
+        ];
+
+        $this->expectException(RuntimeException::class);
+
+        try {
+            (new PaymentTransactionFlowService($adapter, $model))
+                ->verifyTransaction('session-A', 'order-attacker-supplied');
+        } finally {
+            $this->assertSame([], $model->updatedData, 'Mismatch must abort before any update is applied.');
+        }
+    }
+
 }
 
 class FakePaymentProviderAdapter implements PaymentProviderAdapterInterface
 {
+
+    public ?VerifyTransactionRequestDTO $receivedVerifyRequest = null;
 
     public function __construct(
         private readonly ?ProviderTransactionUpdateDTO $registerUpdate = null,
@@ -114,8 +207,10 @@ class FakePaymentProviderAdapter implements PaymentProviderAdapterInterface
         return $this->registerUpdate ?? throw new RuntimeException('Missing register update.');
     }
 
-    public function verifyTransaction(object $transaction): ProviderTransactionUpdateDTO
+    public function verifyTransaction(VerifyTransactionRequestDTO $transaction): ProviderTransactionUpdateDTO
     {
+        $this->receivedVerifyRequest = $transaction;
+
         return $this->verifyUpdate ?? throw new RuntimeException('Missing verify update.');
     }
 
@@ -145,6 +240,9 @@ class FakePaymentTransactionModel extends PaymentTransactionModel
 
     public array $transactionRow = [];
 
+    /** @var array<string, array> Keyed by provider session ID, for findActiveByProviderSession(). */
+    public array $sessionRows = [];
+
     public ?string $lookupSessionId = null;
 
     public function create(array $data): bool
@@ -171,6 +269,11 @@ class FakePaymentTransactionModel extends PaymentTransactionModel
         return $this->transactionRow !== []
             ? $this->transactionRow
             : ['module_payment_transaction' => ['id' => $transactionId, 'provider' => 'przelewy24']];
+    }
+
+    public function findActiveByProviderSession(string $provider, string $providerSessionId): array
+    {
+        return $this->sessionRows[$providerSessionId] ?? [];
     }
 
     public function findByProviderIdentifiers(?string $sessionId = null, ?string $orderId = null, ?string $transactionId = null): array

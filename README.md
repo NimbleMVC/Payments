@@ -73,6 +73,7 @@ Przy kolejnych zmianach schematu należy dodawać nowe pliki migracji, zamiast r
 - `NimblePHP\Payments\DTO\PaymentTransactionDTO`
 - `NimblePHP\Payments\DTO\PaymentFlowResultDTO`
 - `NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO`
+- `NimblePHP\Payments\DTO\VerifyTransactionRequestDTO` - canonical, server-built verify request (PAY-C01); adapters receive this, not caller input
 - `NimblePHP\Payments\Model\PaymentTransactionModel`
 - `NimblePHP\Payments\Service\PaymentTransactionFlowService`
 - `NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface`
@@ -107,7 +108,6 @@ use NimblePHP\Payments\DTO\PaymentTransactionDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Payments;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24RegisterTransactionDTO;
-use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24VerifyTransactionDTO;
 
 $payments = new Payments('przelewy24');
 $flow = $payments->flow();
@@ -115,6 +115,9 @@ $flow = $payments->flow();
 $transaction = new PaymentTransactionDTO();
 $transaction->provider = PaymentSystemEnum::przelewy24;
 $transaction->amount = 12345;
+// objectType/objectId/accountId must come from a server-authorized domain
+// object (the order the caller is actually entitled to pay for, the
+// authenticated account) - never copied directly from request input.
 $transaction->objectType = 'order';
 $transaction->objectId = 123;
 
@@ -137,13 +140,13 @@ $flow->handleWebhook([
     ],
 ]);
 
-$verify = new Przelewy24VerifyTransactionDTO();
-$verify->sessionId = 'session-123';
-$verify->orderId = 10001;
-$verify->amount = 12345;
-$verify->currency = 'PLN';
-
-$flow->verifyTransaction($registered->transactionId, $verify);
+// PAY-C01: verify is keyed by provider session ID, not by a local
+// transaction ID + an independently-built DTO. Amount, currency and
+// merchant/pos/crc are derived server-side from the stored record - never
+// pass them in from the request. providerOrderId comes from the provider
+// (webhook/return redirect) and only feeds the provider's own API call; it
+// never changes which local record gets looked up or updated.
+$flow->verifyTransaction(providerSessionId: 'session-123', providerOrderId: '10001');
 ```
 
 ## Architektura

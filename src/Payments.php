@@ -76,12 +76,15 @@ class Payments
         return $this->flow($transactionModel)->registerTransaction($transaction, $providerTransaction);
     }
 
+    /**
+     * @see PaymentTransactionFlowService::verifyTransaction() for the PAY-C01 contract
+     */
     public function verifyModuleTransaction(
-        int $transactionId,
-        object $providerTransaction,
+        string $providerSessionId,
+        ?string $providerOrderId = null,
         ?PaymentTransactionModel $transactionModel = null
     ): PaymentFlowResultDTO {
-        return $this->flow($transactionModel)->verifyTransaction($transactionId, $providerTransaction);
+        return $this->flow($transactionModel)->verifyTransaction($providerSessionId, $providerOrderId);
     }
 
     public function handleWebhook(array $payload, ?PaymentTransactionModel $transactionModel = null): PaymentFlowResultDTO
