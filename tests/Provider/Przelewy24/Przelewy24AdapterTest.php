@@ -5,6 +5,7 @@ namespace NimblePHP\Payments\Tests\Provider\Przelewy24;
 use InvalidArgumentException;
 use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
+use NimblePHP\Payments\Exceptions\WebhookAuthenticationException;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24ConfigDTO;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24VerifyTransactionDTO;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24VerifyTransactionResponseDTO;
@@ -26,22 +27,113 @@ class Przelewy24AdapterTest extends TestCase
         $this->assertSame(PaymentTransactionStatusEnum::failed, $adapter->mapStatus('failed'));
     }
 
-    public function testParseWebhookCreatesProcessingUpdate(): void
+    /**
+     * PAY-H01: a correctly signed notification, matching the configured
+     * merchant/pos, is still accepted and parsed as before.
+     */
+    public function testParseWebhookCreatesProcessingUpdateForACorrectlySignedNotification(): void
     {
         $adapter = new Przelewy24Adapter($this->createGateway());
+        $data = [
+            'merchantId' => 1,
+            'posId' => 1,
+            'sessionId' => 'session-123',
+            'amount' => 12345,
+            'originAmount' => 12345,
+            'currency' => 'PLN',
+            'orderId' => 10001,
+            'methodId' => 1,
+            'statement' => 'Order #123',
+            'status' => 2,
+        ];
+        $data['sign'] = $this->computeWebhookSign($data, 'crc');
 
-        $update = $adapter->parseWebhook([
-            'data' => [
-                'sessionId' => 'session-123',
-                'orderId' => 10001,
-                'status' => 2,
-            ],
-        ]);
+        $update = $adapter->parseWebhook(['data' => $data]);
 
         $this->assertSame(PaymentTransactionStatusEnum::processing, $update->status);
         $this->assertSame('2', $update->providerStatus);
         $this->assertSame('session-123', $update->providerSessionId);
         $this->assertSame('10001', $update->providerOrderId);
+    }
+
+    public function testParseWebhookRejectsANotificationWithoutASignature(): void
+    {
+        $adapter = new Przelewy24Adapter($this->createGateway());
+
+        $this->expectException(WebhookAuthenticationException::class);
+
+        $adapter->parseWebhook([
+            'data' => [
+                'merchantId' => 1,
+                'posId' => 1,
+                'sessionId' => 'session-123',
+                'orderId' => 10001,
+                'status' => 2,
+            ],
+        ]);
+    }
+
+    public function testParseWebhookRejectsAnInvalidSignature(): void
+    {
+        $adapter = new Przelewy24Adapter($this->createGateway());
+        $data = [
+            'merchantId' => 1,
+            'posId' => 1,
+            'sessionId' => 'session-123',
+            'amount' => 12345,
+            'originAmount' => 12345,
+            'currency' => 'PLN',
+            'orderId' => 10001,
+            'methodId' => 1,
+            'statement' => 'Order #123',
+            'status' => 2,
+        ];
+        // Signed with the wrong CRC - e.g. an attacker who does not know the
+        // real secret guessing at a notification.
+        $data['sign'] = $this->computeWebhookSign($data, 'not-the-real-crc');
+
+        $this->expectException(WebhookAuthenticationException::class);
+
+        $adapter->parseWebhook(['data' => $data]);
+    }
+
+    public function testParseWebhookRejectsAMismatchedMerchantOrPosEvenWithAValidSignatureShape(): void
+    {
+        $adapter = new Przelewy24Adapter($this->createGateway());
+        $data = [
+            'merchantId' => 999, // not this adapter's configured merchantId (1)
+            'posId' => 1,
+            'sessionId' => 'session-123',
+            'amount' => 12345,
+            'originAmount' => 12345,
+            'currency' => 'PLN',
+            'orderId' => 10001,
+            'methodId' => 1,
+            'statement' => 'Order #123',
+            'status' => 2,
+        ];
+        $data['sign'] = $this->computeWebhookSign($data, 'crc');
+
+        $this->expectException(WebhookAuthenticationException::class);
+
+        $adapter->parseWebhook(['data' => $data]);
+    }
+
+    /** Independent reimplementation of the production signing formula, for test fixtures only. */
+    private function computeWebhookSign(array $data, string $crc): string
+    {
+        return hash('sha384', json_encode([
+            'merchantId' => (int)($data['merchantId'] ?? 0),
+            'posId' => (int)($data['posId'] ?? 0),
+            'sessionId' => (string)($data['sessionId'] ?? ''),
+            'amount' => (int)($data['amount'] ?? 0),
+            'originAmount' => (int)($data['originAmount'] ?? 0),
+            'currency' => (string)($data['currency'] ?? ''),
+            'orderId' => (int)($data['orderId'] ?? 0),
+            'methodId' => (int)($data['methodId'] ?? 0),
+            'statement' => (string)($data['statement'] ?? ''),
+            'crc' => $crc,
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     }
 
     /**

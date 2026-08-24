@@ -11,6 +11,7 @@ use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
 use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
 use NimblePHP\Payments\Enum\PaymentSystemEnum;
 use NimblePHP\Payments\Enum\PaymentTransactionStatusEnum;
+use NimblePHP\Payments\Exceptions\WebhookAuthenticationException;
 use NimblePHP\Payments\Model\PaymentTransactionModel;
 use NimblePHP\Payments\Provider\Przelewy24\DTO\Przelewy24ConfigDTO;
 use NimblePHP\Payments\Provider\Przelewy24\Przelewy24Adapter;
@@ -176,6 +177,42 @@ class PaymentTransactionFlowServiceTest extends TestCase
 
         (new PaymentTransactionFlowService($adapter, new FakePaymentTransactionModel()))
             ->handleWebhook(['data' => ['sessionId' => 'missing-session']]);
+    }
+
+    /**
+     * PAY-H01 regression test: an unauthenticated webhook notification (real
+     * adapter, no/invalid signature) must not touch the local model at all -
+     * not the lookup, not any update.
+     *
+     * @throws DatabaseException
+     */
+    public function testHandleWebhookNeverTouchesTheModelForAnUnauthenticatedNotification(): void
+    {
+        $adapter = new Przelewy24Adapter(new Przelewy24Gateway(new Przelewy24ConfigDTO(
+            merchantId: 1,
+            posId: 1,
+            apiKey: 'key',
+            crc: 'crc',
+            sandbox: true
+        )));
+        $model = new FakePaymentTransactionModel();
+
+        try {
+            (new PaymentTransactionFlowService($adapter, $model))->handleWebhook([
+                'data' => [
+                    'sessionId' => 'session-123',
+                    'orderId' => 10001,
+                    'status' => 2,
+                    // no 'sign' at all
+                ],
+            ]);
+            $this->fail('Unsigned webhook notification should have been rejected.');
+        } catch (WebhookAuthenticationException) {
+            $this->addToAssertionCount(1);
+        }
+
+        $this->assertNull($model->lookupSessionId, 'No lookup may run for an unauthenticated notification.');
+        $this->assertSame([], $model->updatedData, 'No update may run for an unauthenticated notification.');
     }
 
     /**

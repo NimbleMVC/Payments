@@ -77,6 +77,7 @@ Przy kolejnych zmianach schematu należy dodawać nowe pliki migracji, zamiast r
 - `NimblePHP\Payments\Model\PaymentTransactionModel`
 - `NimblePHP\Payments\Service\PaymentTransactionFlowService`
 - `NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface`
+- `NimblePHP\Payments\Exceptions\WebhookAuthenticationException` - thrown by `handleWebhook()`/adapter `parseWebhook()` for an unauthenticated notification (PAY-H01)
 
 ### Przelewy24
 
@@ -136,13 +137,13 @@ $register->urlStatus = 'https://example.com/payment/callback';
 $registered = $flow->registerTransaction($transaction, $register);
 $checkoutUrl = $registered->checkoutUrl;
 
-$flow->handleWebhook([
-    'data' => [
-        'sessionId' => 'session-123',
-        'orderId' => 10001,
-        'status' => 2,
-    ],
-]);
+// PAY-H01: P24 signs every real webhook notification (sha384 over
+// merchantId, posId, sessionId, amount, originAmount, currency, orderId,
+// methodId, statement + CRC) as the 'sign' field - handleWebhook() rejects
+// (WebhookAuthenticationException) a payload missing it, with an invalid
+// signature, or a merchantId/posId not matching configuration. Pass the
+// notification body through exactly as P24 sent it; do not build this by hand.
+$flow->handleWebhook($_POST); // real P24 notification body, 'sign' included
 
 // PAY-C01: verify is keyed by provider session ID, not by a local
 // transaction ID + an independently-built DTO. Amount, currency and
