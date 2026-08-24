@@ -45,7 +45,7 @@ class Przelewy24Gateway implements GatewayInterface
         return $this->getCheckoutBaseUrl() . ltrim($token, '/');
     }
 
-    private function getConfig(): Przelewy24ConfigDTO
+    public function getConfig(): Przelewy24ConfigDTO
     {
         return $this->config ?? Przelewy24ConfigDTO::fromConfig();
     }
