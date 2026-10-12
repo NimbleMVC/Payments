@@ -3,6 +3,7 @@
 namespace NimblePHP\Payments\Provider\Przelewy24;
 
 use InvalidArgumentException;
+use JsonException;
 use NimblePHP\Payments\Contracts\PaymentProviderAdapterInterface;
 use NimblePHP\Payments\DTO\ProviderTransactionUpdateDTO;
 use NimblePHP\Payments\DTO\VerifyTransactionRequestDTO;
@@ -149,18 +150,24 @@ class Przelewy24Adapter implements PaymentProviderAdapterInterface
             );
         }
 
-        $expectedSign = hash('sha384', json_encode([
-            'merchantId' => $merchantId,
-            'posId' => $posId,
-            'sessionId' => (string)($data['sessionId'] ?? ''),
-            'amount' => (int)($data['amount'] ?? 0),
-            'originAmount' => (int)($data['originAmount'] ?? 0),
-            'currency' => (string)($data['currency'] ?? ''),
-            'orderId' => (int)($data['orderId'] ?? 0),
-            'methodId' => (int)($data['methodId'] ?? 0),
-            'statement' => (string)($data['statement'] ?? ''),
-            'crc' => $config->crc,
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        try {
+            $signPayload = json_encode([
+                'merchantId' => $merchantId,
+                'posId' => $posId,
+                'sessionId' => (string)($data['sessionId'] ?? ''),
+                'amount' => (int)($data['amount'] ?? 0),
+                'originAmount' => (int)($data['originAmount'] ?? 0),
+                'currency' => (string)($data['currency'] ?? ''),
+                'orderId' => (int)($data['orderId'] ?? 0),
+                'methodId' => (int)($data['methodId'] ?? 0),
+                'statement' => (string)($data['statement'] ?? ''),
+                'crc' => $config->crc,
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            throw new WebhookAuthenticationException('Przelewy24 webhook notification contains invalid data.');
+        }
+
+        $expectedSign = hash('sha384', $signPayload);
 
         if (!hash_equals($expectedSign, (string)$sign)) {
             throw new WebhookAuthenticationException('Przelewy24 webhook notification signature is invalid.');

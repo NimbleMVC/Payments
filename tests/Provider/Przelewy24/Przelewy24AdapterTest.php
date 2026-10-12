@@ -119,6 +119,28 @@ class Przelewy24AdapterTest extends TestCase
         $adapter->parseWebhook(['data' => $data]);
     }
 
+    public function testParseWebhookRejectsInvalidUtf8InsteadOfSigningAnEmptyPayload(): void
+    {
+        $adapter = new Przelewy24Adapter($this->createGateway());
+        $data = [
+            'merchantId' => 1,
+            'posId' => 1,
+            'sessionId' => 'session-123',
+            'amount' => 12345,
+            'originAmount' => 12345,
+            'currency' => 'PLN',
+            'orderId' => 10001,
+            'methodId' => 1,
+            'statement' => "\xFF",
+            'status' => 2,
+            'sign' => hash('sha384', ''),
+        ];
+
+        $this->expectException(WebhookAuthenticationException::class);
+
+        $adapter->parseWebhook(['data' => $data]);
+    }
+
     /** Independent reimplementation of the production signing formula, for test fixtures only. */
     private function computeWebhookSign(array $data, string $crc): string
     {
